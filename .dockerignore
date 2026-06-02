@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+probe*.py
+.git/
+.github/
+.DS_Store
+README.md
+*.md

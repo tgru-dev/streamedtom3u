@@ -1,0 +1,12 @@
+services:
+  streamedtom3u:
+    image: ghcr.io/tgru-dev/streamedtom3u:latest
+    container_name: streamedtom3u
+    restart: unless-stopped
+    # Chromium needs a larger /dev/shm than Docker's 64 MB default
+    shm_size: "1gb"
+    ports:
+      - "8765:8765"
+    environment:
+      - PORT=8765
+      - LOG_LEVEL=INFO

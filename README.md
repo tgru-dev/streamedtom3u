@@ -20,20 +20,44 @@ Dieser Server löst das, indem er:
 
 So bekommt Jellyfin am Ende einen sauberen, dauerhaft funktionierenden HLS-Strom.
 
-## Setup
+## Schnellstart mit Docker (empfohlen)
+
+Fertige Multi-Arch-Images (`linux/amd64` + `linux/arm64`) liegen auf
+GitHub Container Registry:
+
+```bash
+docker run -d \
+  --name streamedtom3u \
+  --restart unless-stopped \
+  --shm-size=1g \
+  -p 8765:8765 \
+  ghcr.io/tgru-dev/streamedtom3u:latest
+```
+
+`--shm-size=1g` ist wichtig: Chromium braucht mehr als die Docker-Defaults von 64 MB,
+sonst crasht der Tab nach kurzer Zeit.
+
+Oder mit `docker-compose.yml` (liegt im Repo):
+
+```bash
+curl -O https://raw.githubusercontent.com/tgru-dev/streamedtom3u/main/docker-compose.yml
+docker compose up -d
+docker compose logs -f
+```
+
+Update:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+## Setup ohne Docker (Entwicklung)
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/playwright install chromium
-```
-
-## Start
-
-```bash
 .venv/bin/python server.py        # läuft auf 0.0.0.0:8765
-# oder
-PORT=9000 LOG_LEVEL=DEBUG .venv/bin/python server.py
 ```
 
 Optionaler Systemd-Service (auf einem Pi/NAS) am Ende.
