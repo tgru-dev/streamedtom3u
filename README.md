@@ -32,8 +32,12 @@ docker run -d \
   --shm-size=1g \
   -p 8765:8765 \
   -p 8768:8768 \
+  -v streamedtom3u_data:/data \
   ghcr.io/tgru-dev/streamedtom3u:latest
 ```
+
+Das Volume speichert die manuell angehefteten Spiele (`/data/manual.json`),
+damit deine Auswahl Container-Updates und Reboots überlebt.
 
 | Port | Zweck |
 | --- | --- |
@@ -91,7 +95,11 @@ Unter `http://<server-ip>:8768/` läuft ein kleines Web-Dashboard:
 
 - Status: Uptime, Browser-Health, Zähler für ausgelieferte m3u8 / TS-Segmente
 - Liste aller gerade offenen Browser-Tabs inkl. m3u8-Alter, Idle-Zeit und Stop-Button
-- Heutige Football-Matches mit erkannter Liga (in Playlist ↔ gefiltert)
+- Heutige Football-Matches mit erkannter Liga
+- **★ Pin-Button** pro Match: Spiele ohne BL/WM/EM-Erkennung können manuell zur
+  Playlist hinzugefügt werden (Gruppe „Andere"). Die Auswahl wird in
+  `/data/manual.json` persistiert
+- Filter „alle / in Playlist / ★ angeheftet"
 - Auto-Refresh alle 5 s, keine Auth — nur im internen Netz exponieren
 
 JSON-Endpoints für eigene Tools:
@@ -100,8 +108,11 @@ JSON-Endpoints für eigene Tools:
 | --- | --- |
 | `GET :8768/api/status` | Counter + Browser-Health |
 | `GET :8768/api/streams` | Aktive Stream-Tabs |
-| `GET :8768/api/matches` | Heutige Football-Matches + Liga-Detection |
-| `DELETE :8768/api/streams/{src}/{id}/{n}` | Tab manuell schließen |
+| `GET :8768/api/matches` | Heutige Football-Matches + Liga + `is_manual` |
+| `GET :8768/api/manual` | Liste der angehefteten echo-IDs |
+| `POST :8768/api/manual/{echo_id}?title=…` | Match anheften |
+| `DELETE :8768/api/manual/{echo_id}` | Anheftung lösen |
+| `DELETE :8768/api/streams/{src}/{id}/{n}` | Browser-Tab manuell schließen |
 
 ## Endpoints (Proxy auf Port 8765)
 

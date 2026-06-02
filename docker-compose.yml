@@ -11,4 +11,10 @@ services:
     environment:
       - PORT=8765
       - UI_PORT=8768
+      - DATA_DIR=/data
       - LOG_LEVEL=INFO
+    volumes:
+      - streamedtom3u_data:/data
+
+volumes:
+  streamedtom3u_data:

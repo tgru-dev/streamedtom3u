@@ -58,6 +58,11 @@ RUN pip install -r requirements.txt && \
 
 COPY server.py ./
 
+# Persistent state lives here; mount a volume to survive container recreation
+RUN mkdir -p /data
+VOLUME ["/data"]
+ENV DATA_DIR=/data
+
 EXPOSE 8765 8768
 
 # Tini-less; uvicorn handles SIGTERM cleanly via lifespan

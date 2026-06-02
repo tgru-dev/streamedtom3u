@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import re
@@ -24,6 +25,7 @@ import time
 import urllib.parse
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -48,6 +50,9 @@ M3U8_MAX_AGE_SECONDS = 8
 
 STARTED_AT = time.time()
 
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data" if Path("/data").exists() else "."))
+MANUAL_FILE = DATA_DIR / "manual.json"
+
 
 @dataclass
 class Stats:
@@ -59,6 +64,58 @@ class Stats:
 
 
 stats = Stats()
+
+
+class ManualSelection:
+    """User-pinned matches that should appear in the playlist regardless of league."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = asyncio.Lock()
+        # Map echo_id -> {"title": str, "added_at": float}
+        self._items: dict[str, dict] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            self._items = json.loads(self.path.read_text())
+            if not isinstance(self._items, dict):
+                self._items = {}
+        except FileNotFoundError:
+            self._items = {}
+        except Exception as e:
+            log.warning("manual selection load failed (%s): %s", self.path, e)
+            self._items = {}
+
+    def _save(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self._items, indent=2))
+            tmp.replace(self.path)
+        except Exception as e:
+            log.warning("manual selection save failed (%s): %s", self.path, e)
+
+    def all(self) -> dict[str, dict]:
+        return dict(self._items)
+
+    def contains(self, echo_id: str) -> bool:
+        return echo_id in self._items
+
+    async def add(self, echo_id: str, title: Optional[str] = None) -> None:
+        async with self._lock:
+            self._items[echo_id] = {"title": title, "added_at": time.time()}
+            self._save()
+
+    async def remove(self, echo_id: str) -> bool:
+        async with self._lock:
+            existed = self._items.pop(echo_id, None) is not None
+            if existed:
+                self._save()
+            return existed
+
+
+manual = ManualSelection(MANUAL_FILE)
 
 
 @dataclass
@@ -283,50 +340,76 @@ def first_echo_source(match: dict) -> Optional[dict]:
     return None
 
 
-@app.get("/playlist.m3u")
-async def playlist(request: Request, scope: str = "today") -> PlainTextResponse:
-    """
-    German-football-only playlist (Bundesliga 1/2/3, WM, EM).
-    Only the first `echo` stream per match is exposed (one entry per match).
-
-    - scope=today (default): today's football matches (live + upcoming)
-    - scope=live:            only currently-live football matches
-    """
+async def _fetch_match_pool(scope: str) -> list[dict]:
+    """Get the candidate pool of football matches for the chosen scope."""
     if scope == "live":
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(f"{API_BASE}/matches/live")
             r.raise_for_status()
-            matches = [m for m in r.json() if m.get("category") == "football"]
-    else:
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(f"{API_BASE}/matches/football")
-            r.raise_for_status()
-            matches = r.json()
+            return [m for m in r.json() if m.get("category") == "football"]
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get(f"{API_BASE}/matches/football")
+        r.raise_for_status()
+        return r.json()
 
+
+def _playlist_entry_for(m: dict, group_label: str) -> Optional[tuple[str, str, str]]:
+    """Return (tvg_id, extinf, stream_path_suffix) for a match, or None if no echo source."""
+    echo = first_echo_source(m)
+    if not echo:
+        return None
+    mid = m.get("id")
+    title = m.get("title", mid)
+    poster = m.get("poster") or ""
+    logo = f"https://streamed.pk{poster}" if poster.startswith("/") else (poster or "")
+    source = "echo"
+    sid = echo["id"]
+    stream_no = 1
+    tvg_id = f"{source}-{sid}-{stream_no}"
+    extinf = (
+        f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{title}" '
+        f'tvg-logo="{logo}" group-title="{group_label}",{title}'
+    )
+    return tvg_id, extinf, f"/stream/{source}/{sid}/{stream_no}.m3u8"
+
+
+@app.get("/playlist.m3u")
+async def playlist(request: Request, scope: str = "today") -> PlainTextResponse:
+    """
+    Generate the M3U:
+      - all matches whose league is detected as Bundesliga/2. BL/3. Liga/WM/EM
+      - PLUS any match the user manually pinned via the dashboard (group = "Andere")
+
+    Only the first `echo` stream per match is included.
+
+    - scope=today (default): today's football matches (live + upcoming)
+    - scope=live:            only currently-live football matches
+    """
+    matches = await _fetch_match_pool(scope)
     base = _request_base(request)
     lines = ["#EXTM3U"]
+    seen_keys: set[str] = set()
+
     for m in matches:
-        league = detect_league(m)
-        if not league:
-            continue
         echo = first_echo_source(m)
         if not echo:
             continue
+        echo_id = echo["id"]
+        league = detect_league(m)
+        is_manual = manual.contains(echo_id)
+        if not league and not is_manual:
+            continue
 
-        mid = m.get("id")
-        title = m.get("title", mid)
-        poster = m.get("poster") or ""
-        logo = f"https://streamed.pk{poster}" if poster.startswith("/") else (poster or "")
-        source = "echo"
-        sid = echo["id"]
-        stream_no = 1
-        tvg_id = f"{source}-{sid}-{stream_no}"
-        extinf = (
-            f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{title}" '
-            f'tvg-logo="{logo}" group-title="{league}",{title}'
-        )
+        group_label = league if league else "Andere"
+        entry = _playlist_entry_for(m, group_label)
+        if not entry:
+            continue
+        tvg_id, extinf, suffix = entry
+        if tvg_id in seen_keys:
+            continue
+        seen_keys.add(tvg_id)
         lines.append(extinf)
-        lines.append(f"{base}/stream/{source}/{sid}/{stream_no}.m3u8")
+        lines.append(f"{base}{suffix}")
     body = "\n".join(lines) + "\n"
     return PlainTextResponse(body, media_type="application/vnd.apple.mpegurl")
 
@@ -477,31 +560,45 @@ async def ui_close_stream(source: str, mid: str, stream_no: int) -> dict:
 
 @ui_app.get("/api/matches")
 async def ui_matches(scope: str = "today") -> list[dict]:
-    """Same league-filtered list the playlist endpoint uses, but as structured JSON."""
-    if scope == "live":
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(f"{API_BASE}/matches/live")
-            r.raise_for_status()
-            matches = [m for m in r.json() if m.get("category") == "football"]
-    else:
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(f"{API_BASE}/matches/football")
-            r.raise_for_status()
-            matches = r.json()
-
+    """All today's football matches with league detection + manual-pin state."""
+    matches = await _fetch_match_pool(scope)
     now_ms = time.time() * 1000
     out = []
     for m in matches:
         league = detect_league(m)
         echo = first_echo_source(m)
+        echo_id = echo["id"] if echo else None
+        is_manual = bool(echo_id and manual.contains(echo_id))
         out.append({
             "title": m.get("title"),
             "league": league,
-            "echo_id": echo["id"] if echo else None,
-            "in_playlist": bool(league and echo),
+            "echo_id": echo_id,
+            "is_manual": is_manual,
+            "in_playlist": bool(echo_id and (league or is_manual)),
             "starts_in_minutes": round((m.get("date", 0) - now_ms) / 60000) if m.get("date") else None,
         })
     return out
+
+
+@ui_app.get("/api/manual")
+async def ui_manual_list() -> list[dict]:
+    return [{"echo_id": k, **v} for k, v in manual.all().items()]
+
+
+@ui_app.post("/api/manual/{echo_id}")
+async def ui_manual_add(echo_id: str, title: Optional[str] = None) -> dict:
+    if not echo_id:
+        raise HTTPException(400, "echo_id required")
+    await manual.add(echo_id, title)
+    return {"added": echo_id}
+
+
+@ui_app.delete("/api/manual/{echo_id}")
+async def ui_manual_remove(echo_id: str) -> dict:
+    removed = await manual.remove(echo_id)
+    if not removed:
+        raise HTTPException(404, "not pinned")
+    return {"removed": echo_id}
 
 
 INDEX_HTML = """\
@@ -550,9 +647,18 @@ INDEX_HTML = """\
   td .badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
     background: rgba(110,168,254,.15); color: var(--accent); }
   td .badge.muted { background: rgba(139,145,166,.15); color: var(--muted); }
+  td .badge.warn { background: rgba(251,191,36,.15); color: var(--warn); }
   td button { background: transparent; border: 1px solid var(--border); color: var(--err);
     border-radius: 6px; padding: 3px 10px; cursor: pointer; font-size: 11px; }
   td button:hover { border-color: var(--err); }
+  td button.pin { color: var(--muted); font-size: 14px; padding: 2px 8px; line-height: 1; }
+  td button.pin:hover { border-color: var(--accent); color: var(--accent); }
+  td button.pin.on { color: var(--warn); border-color: rgba(251,191,36,.4); }
+  .filter { display: flex; gap: 6px; margin-left: auto; }
+  .filter button { background: transparent; border: 1px solid var(--border);
+    color: var(--muted); border-radius: 6px; padding: 4px 10px; cursor: pointer;
+    font-size: 11px; font-weight: 500; }
+  .filter button.active { background: var(--accent); color: #0f1117; border-color: var(--accent); }
   .empty { padding: 22px 18px; color: var(--muted); font-style: italic; text-align: center; }
   footer { padding: 16px 28px; color: var(--muted); font-size: 11px; }
   footer code { font-family: var(--mono); background: var(--panel);
@@ -580,7 +686,14 @@ INDEX_HTML = """\
   </section>
 
   <section class="card" style="grid-column: 1 / -1;">
-    <h2>Spiele (heute) <span id="match-count" style="color:var(--muted);font-weight:400;"></span></h2>
+    <h2>
+      Spiele (heute) <span id="match-count" style="color:var(--muted);font-weight:400;"></span>
+      <span class="filter" id="match-filter">
+        <button data-filter="all" class="active">alle</button>
+        <button data-filter="playlist">in Playlist</button>
+        <button data-filter="pinned">★ angeheftet</button>
+      </span>
+    </h2>
     <div id="matches-wrap"><div class="empty">Lade …</div></div>
   </section>
 </main>
@@ -680,37 +793,7 @@ async function load() {
       });
     }
 
-    const matchesWrap = document.getElementById("matches-wrap");
-    const inPlaylist = matches.filter(m => m.in_playlist);
-    document.getElementById("match-count").textContent =
-      `(${inPlaylist.length} in Playlist · ${matches.length - inPlaylist.length} gefiltert)`;
-    if (matches.length === 0) {
-      matchesWrap.innerHTML = '<div class="empty">Keine Football-Matches in der API.</div>';
-    } else {
-      matchesWrap.innerHTML = `
-        <table>
-          <thead><tr><th>Match</th><th>Liga</th><th>Startet</th><th>echo-ID</th><th></th></tr></thead>
-          <tbody>
-            ${matches.map(m => {
-              const playUrl = m.in_playlist
-                ? playlistBase + "/stream/echo/" + encodeURIComponent(m.echo_id) + "/1.m3u8"
-                : null;
-              return `
-                <tr style="${m.in_playlist ? '' : 'opacity:.5'}">
-                  <td>${escape(m.title)}</td>
-                  <td>${m.league
-                    ? '<span class="badge">' + escape(m.league) + '</span>'
-                    : '<span class="badge muted">—</span>'}</td>
-                  <td>${m.starts_in_minutes == null ? "—" :
-                       m.starts_in_minutes <= 0 ? '<span class="badge">live</span>' :
-                       'in ' + m.starts_in_minutes + 'm'}</td>
-                  <td class="mono">${escape(m.echo_id || "—")}</td>
-                  <td>${playUrl ? '<a href="' + playUrl + '" target="_blank" rel="noopener">m3u8 ↗</a>' : ""}</td>
-                </tr>`;
-            }).join("")}
-          </tbody>
-        </table>`;
-    }
+    renderMatches(matches, playlistBase);
 
   } catch (err) {
     document.getElementById("health").className = "pill err";
@@ -718,6 +801,95 @@ async function load() {
     console.error(err);
   }
 }
+
+let currentFilter = "all";
+let lastMatches = [];
+let lastPlaylistBase = "";
+
+function renderMatches(matches, playlistBase) {
+  lastMatches = matches;
+  lastPlaylistBase = playlistBase;
+
+  const inPlaylist = matches.filter(m => m.in_playlist);
+  const pinned = matches.filter(m => m.is_manual);
+  document.getElementById("match-count").textContent =
+    `(${inPlaylist.length} in Playlist · ${pinned.length} angeheftet · ${matches.length} gesamt)`;
+
+  const filtered = matches.filter(m => {
+    if (currentFilter === "playlist") return m.in_playlist;
+    if (currentFilter === "pinned") return m.is_manual;
+    return true;
+  });
+
+  const wrap = document.getElementById("matches-wrap");
+  if (filtered.length === 0) {
+    wrap.innerHTML = '<div class="empty">Keine Spiele in dieser Ansicht.</div>';
+    return;
+  }
+  wrap.innerHTML = `
+    <table>
+      <thead><tr>
+        <th style="width:1px"></th><th>Match</th><th>Gruppe</th>
+        <th>Startet</th><th>echo-ID</th><th>Play</th>
+      </tr></thead>
+      <tbody>
+        ${filtered.map(m => {
+          const canPin = !!m.echo_id;
+          const playUrl = m.in_playlist
+            ? playlistBase + "/stream/echo/" + encodeURIComponent(m.echo_id) + "/1.m3u8"
+            : null;
+          const group = m.league
+            ? '<span class="badge">' + escape(m.league) + '</span>'
+            : m.is_manual
+              ? '<span class="badge warn">★ Andere</span>'
+              : '<span class="badge muted">—</span>';
+          return `
+            <tr style="${m.in_playlist ? '' : 'opacity:.55'}">
+              <td>${canPin
+                ? '<button class="pin' + (m.is_manual ? ' on' : '') + '" '
+                  + 'data-echo="' + escape(m.echo_id) + '" '
+                  + 'data-title="' + escape(m.title || '') + '" '
+                  + 'data-on="' + (m.is_manual ? '1' : '0') + '" '
+                  + 'title="' + (m.is_manual ? 'Aus der Playlist entfernen' : 'Zur Playlist hinzufügen') + '">★</button>'
+                : ''}</td>
+              <td>${escape(m.title)}</td>
+              <td>${group}</td>
+              <td>${m.starts_in_minutes == null ? "—" :
+                   m.starts_in_minutes <= 0 ? '<span class="badge">live</span>' :
+                   'in ' + m.starts_in_minutes + 'm'}</td>
+              <td class="mono">${escape(m.echo_id || "—")}</td>
+              <td>${playUrl ? '<a href="' + playUrl + '" target="_blank" rel="noopener">m3u8 ↗</a>' : ""}</td>
+            </tr>`;
+        }).join("")}
+      </tbody>
+    </table>`;
+
+  wrap.querySelectorAll("button.pin").forEach(b => {
+    b.onclick = async () => {
+      const echoId = b.dataset.echo;
+      const isOn = b.dataset.on === "1";
+      b.disabled = true;
+      const method = isOn ? "DELETE" : "POST";
+      const url = "/api/manual/" + encodeURIComponent(echoId)
+                + (isOn ? "" : "?title=" + encodeURIComponent(b.dataset.title || ""));
+      const res = await fetch(url, { method });
+      if (!res.ok && res.status !== 404) {
+        alert("Fehler: " + res.status);
+        b.disabled = false;
+        return;
+      }
+      await load();
+    };
+  });
+}
+
+document.getElementById("match-filter").addEventListener("click", (e) => {
+  if (e.target.tagName !== "BUTTON") return;
+  currentFilter = e.target.dataset.filter;
+  document.querySelectorAll("#match-filter button").forEach(b =>
+    b.classList.toggle("active", b === e.target));
+  if (lastMatches.length) renderMatches(lastMatches, lastPlaylistBase);
+});
 
 const PROXY_PORT = __PROXY_PORT__;
 load();
