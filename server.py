@@ -240,45 +240,102 @@ async def index() -> dict:
     }
 
 
+# League detection from delta/admin source IDs (echo IDs don't encode the league).
+# Order matters: longer / more specific substrings must come first.
+LEAGUE_RULES: list[tuple[str, tuple[str, ...]]] = [
+    ("2. Bundesliga", ("2-bundesliga", "bundesliga-2", "2nd-bundesliga", "zweite-bundesliga")),
+    ("3. Liga",        ("3-liga", "3rd-liga", "dritte-liga", "liga-3")),
+    ("Bundesliga",     ("germany-bundesliga", "1-bundesliga", "bundesliga")),
+    ("WM",             ("fifa-world-cup", "world-cup", "weltmeisterschaft", "fifa-wm")),
+    ("EM",             ("uefa-european-championship", "european-championship",
+                        "uefa-euro", "euro-2024", "euro-2028", "europameisterschaft")),
+]
+
+
+def detect_league(match: dict) -> Optional[str]:
+    haystack = (match.get("id") or "").lower()
+    for s in match.get("sources") or []:
+        haystack += " " + (s.get("id") or "").lower()
+    for label, needles in LEAGUE_RULES:
+        if any(n in haystack for n in needles):
+            return label
+    return None
+
+
+def first_echo_source(match: dict) -> Optional[dict]:
+    for s in match.get("sources") or []:
+        if s.get("source") == "echo" and s.get("id"):
+            return s
+    return None
+
+
 @app.get("/playlist.m3u")
-async def playlist(request: Request, scope: str = "live") -> PlainTextResponse:
+async def playlist(request: Request, scope: str = "today") -> PlainTextResponse:
     """
-    Generate the M3U playlist.
-    - scope=live (default): only currently-live matches
-    - scope=all-today:       today's matches (live + upcoming)
+    German-football-only playlist (Bundesliga 1/2/3, WM, EM).
+    Only the first `echo` stream per match is exposed (one entry per match).
+
+    - scope=today (default): today's football matches (live + upcoming)
+    - scope=live:            only currently-live football matches
     """
-    path = "/matches/live" if scope == "live" else "/matches/all-today"
-    async with httpx.AsyncClient(timeout=15) as c:
-        r = await c.get(f"{API_BASE}{path}")
-        r.raise_for_status()
-        matches = r.json()
+    if scope == "live":
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{API_BASE}/matches/live")
+            r.raise_for_status()
+            matches = [m for m in r.json() if m.get("category") == "football"]
+    else:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{API_BASE}/matches/football")
+            r.raise_for_status()
+            matches = r.json()
 
     base = _request_base(request)
     lines = ["#EXTM3U"]
     for m in matches:
+        league = detect_league(m)
+        if not league:
+            continue
+        echo = first_echo_source(m)
+        if not echo:
+            continue
+
         mid = m.get("id")
         title = m.get("title", mid)
-        category = m.get("category", "other")
         poster = m.get("poster") or ""
         logo = f"https://streamed.pk{poster}" if poster.startswith("/") else (poster or "")
-        for src in m.get("sources", []) or []:
-            source = src.get("source")
-            sid = src.get("id") or mid
-            if not source or not sid:
-                continue
-            # We don't know in advance how many streams each source has; advertise #1
-            # (most matches have it, the API exposes more on demand). Users can edit the
-            # playlist if they want streams #2+, or call /streams to discover them.
-            stream_no = 1
-            tvg_id = f"{source}-{sid}-{stream_no}"
-            extinf = (
-                f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{title}" '
-                f'tvg-logo="{logo}" group-title="{category}",{title} ({source})'
-            )
-            lines.append(extinf)
-            lines.append(f"{base}/stream/{source}/{sid}/{stream_no}.m3u8")
+        source = "echo"
+        sid = echo["id"]
+        stream_no = 1
+        tvg_id = f"{source}-{sid}-{stream_no}"
+        extinf = (
+            f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{title}" '
+            f'tvg-logo="{logo}" group-title="{league}",{title}'
+        )
+        lines.append(extinf)
+        lines.append(f"{base}/stream/{source}/{sid}/{stream_no}.m3u8")
     body = "\n".join(lines) + "\n"
     return PlainTextResponse(body, media_type="application/vnd.apple.mpegurl")
+
+
+@app.get("/debug/football")
+async def debug_football(scope: str = "today") -> list[dict]:
+    """Diagnostic: show every football match the API returns, the detected league,
+    and whether an echo stream exists. Useful when the playlist looks empty."""
+    path = "/matches/live" if scope == "live" else "/matches/football"
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get(f"{API_BASE}{path}")
+        r.raise_for_status()
+        raw = r.json()
+    matches = [m for m in raw if m.get("category") == "football"] if scope == "live" else raw
+    out = []
+    for m in matches:
+        out.append({
+            "title": m.get("title"),
+            "league": detect_league(m),
+            "echo": (first_echo_source(m) or {}).get("id"),
+            "sources": [(s.get("source"), s.get("id")) for s in m.get("sources") or []],
+        })
+    return out
 
 
 @app.get("/streams/{source}/{mid}")

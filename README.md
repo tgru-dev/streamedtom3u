@@ -38,15 +38,33 @@ PORT=9000 LOG_LEVEL=DEBUG .venv/bin/python server.py
 
 Optionaler Systemd-Service (auf einem Pi/NAS) am Ende.
 
+## Was die Playlist enthält
+
+Die Playlist ist auf **deutschen Fußball** gefiltert:
+
+- Bundesliga (1)
+- 2. Bundesliga
+- 3. Liga
+- WM (FIFA World Cup)
+- EM (UEFA European Championship)
+
+Pro Match wird **nur ein Eintrag** ausgegeben – die **erste `echo`-Source**, Stream `#1`.
+Spiele ohne `echo`-Source oder ohne erkennbare Liga werden übersprungen.
+
+> Die Liga-Erkennung läuft über Slugs in den `delta`/`admin`-Source-IDs
+> (z. B. `live_germany-bundesliga_…`, `live_fifa-world-cup_…`). Wenn ein Match
+> trotz erwarteter Liga nicht erscheint, hilft `/debug/football`.
+
 ## Endpoints
 
 | Pfad | Zweck |
 | --- | --- |
-| `GET /playlist.m3u` | Komplette M3U mit allen Live-Matches |
-| `GET /playlist.m3u?scope=all-today` | Inkl. heutiger noch nicht gestarteter Spiele |
-| `GET /stream/{source}/{id}/{n}.m3u8` | Live-Playlist für genau einen Stream |
-| `GET /streams/{source}/{id}` | Hilfs-Endpoint: zeigt verfügbare Stream-Nummern |
-| `GET /seg?u=…` | Reicht ein TS-Segment durch (interner Endpunkt) |
+| `GET /playlist.m3u` | Gefilterte M3U für heute (live + heute geplant) |
+| `GET /playlist.m3u?scope=live` | Nur aktuell laufende Spiele |
+| `GET /stream/{source}/{id}/{n}.m3u8` | Live-Playlist für einen einzelnen Stream |
+| `GET /streams/{source}/{id}` | Verfügbare Stream-Nummern eines Matches |
+| `GET /debug/football` | Diagnose: alle Football-Matches + erkannte Liga + Echo-ID |
+| `GET /seg?u=…` | TS-Segment-Proxy (intern) |
 
 ## Jellyfin einrichten
 
@@ -84,9 +102,15 @@ neu geladen, damit ein frisches Live-Window vom Upstream kommt.
   Chromium-Tab (~100 MB RAM). Für ein Familien-Setup okay, nicht für
   Multi-User-Hosting gedacht.
 - **Kein EPG**: die API liefert kein Programm, daher reine "Channel"-Liste.
-- **Stream `#1` per Default**: `/playlist.m3u` listet nur Stream Nummer 1 pro
-  Match. `/streams/{source}/{id}` zeigt die anderen; bei Bedarf `.../2.m3u8`
-  etc. einfach von Hand in eine eigene M3U eintragen.
+- **Nur `echo`-Stream #1**: pro Match ist genau ein Eintrag in der Playlist.
+  `/streams/{source}/{id}` zeigt die anderen verfügbaren Streams; bei Bedarf
+  `.../2.m3u8` etc. von Hand in eine eigene M3U eintragen.
+- **Saisonpause**: zwischen Mai und August zeigt `/playlist.m3u` typischerweise
+  nichts — Bundesliga pausiert, und WM/EM finden nur in bestimmten Jahren statt.
+  `/debug/football` zeigt, was die API gerade liefert.
+- **Liga-Erkennung ist heuristisch**: wenn `streamed.pk` einen neuen Slug für
+  z. B. die 3. Liga einführt, taucht das Match nicht auf. Anpassbar in
+  `LEAGUE_RULES` in `server.py`.
 
 ## Optional: systemd-Unit (Linux/NAS)
 
