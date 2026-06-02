@@ -7,3 +7,4 @@ probe3.py
 probe4.py
 /tmp/
 .DS_Store
+.claude/
