@@ -58,7 +58,7 @@ RUN pip install -r requirements.txt && \
 
 COPY server.py ./
 
-EXPOSE 8765
+EXPOSE 8765 8768
 
 # Tini-less; uvicorn handles SIGTERM cleanly via lifespan
 CMD ["python", "server.py"]

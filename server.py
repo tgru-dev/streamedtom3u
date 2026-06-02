@@ -46,6 +46,20 @@ IDLE_CLOSE_SECONDS = 90
 # How long we serve a cached m3u8 body before requiring a fresh sniff
 M3U8_MAX_AGE_SECONDS = 8
 
+STARTED_AT = time.time()
+
+
+@dataclass
+class Stats:
+    m3u8_served: int = 0
+    m3u8_errors: int = 0
+    segments_served: int = 0
+    segment_errors: int = 0
+    bytes_proxied: int = 0
+
+
+stats = Stats()
+
 
 @dataclass
 class StreamTab:
@@ -349,9 +363,14 @@ async def list_streams(source: str, mid: str) -> list[dict]:
 
 @app.get("/stream/{source}/{mid}/{stream_no}.m3u8")
 async def stream_m3u8(source: str, mid: str, stream_no: int, request: Request) -> PlainTextResponse:
-    tab = await registry.get_or_open(source, mid, stream_no)
-    body, m3u8_url = await registry.fresh_m3u8(tab)
+    try:
+        tab = await registry.get_or_open(source, mid, stream_no)
+        body, m3u8_url = await registry.fresh_m3u8(tab)
+    except Exception:
+        stats.m3u8_errors += 1
+        raise
     rewritten = _rewrite_m3u8(body, m3u8_url, _request_base(request))
+    stats.m3u8_served += 1
     return PlainTextResponse(rewritten, media_type="application/vnd.apple.mpegurl")
 
 
@@ -383,13 +402,16 @@ async def segment(u: str) -> StreamingResponse:
         body = await upstream.aread()
         await upstream.aclose()
         await client.aclose()
+        stats.segment_errors += 1
         raise HTTPException(upstream.status_code, body.decode(errors="replace")[:200])
 
     media_type = upstream.headers.get("content-type", "video/mp2t")
+    stats.segments_served += 1
 
     async def gen():
         try:
             async for chunk in upstream.aiter_bytes(64 * 1024):
+                stats.bytes_proxied += len(chunk)
                 yield chunk
         finally:
             await upstream.aclose()
@@ -404,6 +426,332 @@ async def segment(u: str) -> StreamingResponse:
     return StreamingResponse(gen(), media_type=media_type, headers=fwd)
 
 
-if __name__ == "__main__":
+# ---------- UI app (separate FastAPI on a separate port) ----------
+
+ui_app = FastAPI(title="streamedtom3u-ui")
+
+
+@ui_app.get("/api/status")
+async def ui_status() -> dict:
+    return {
+        "uptime_seconds": int(time.time() - STARTED_AT),
+        "browser_ok": bool(registry.browser and registry.browser.is_connected()),
+        "active_tabs": len(registry.tabs),
+        "m3u8_served": stats.m3u8_served,
+        "m3u8_errors": stats.m3u8_errors,
+        "segments_served": stats.segments_served,
+        "segment_errors": stats.segment_errors,
+        "bytes_proxied": stats.bytes_proxied,
+        "idle_close_seconds": IDLE_CLOSE_SECONDS,
+        "m3u8_max_age_seconds": M3U8_MAX_AGE_SECONDS,
+    }
+
+
+@ui_app.get("/api/streams")
+async def ui_streams() -> list[dict]:
+    now = time.time()
+    out = []
+    for tab in registry.tabs.values():
+        out.append({
+            "key": tab.key,
+            "embed_url": tab.embed_url,
+            "m3u8_url": tab.last_m3u8_url,
+            "m3u8_bytes": len(tab.last_m3u8_body) if tab.last_m3u8_body else 0,
+            "m3u8_age_seconds": round(now - tab.last_m3u8_at, 1) if tab.last_m3u8_at else None,
+            "idle_seconds": round(now - tab.last_accessed, 1),
+            "closed": tab.closed,
+        })
+    out.sort(key=lambda x: x["idle_seconds"])
+    return out
+
+
+@ui_app.delete("/api/streams/{source}/{mid}/{stream_no}")
+async def ui_close_stream(source: str, mid: str, stream_no: int) -> dict:
+    key = f"{source}/{mid}/{stream_no}"
+    tab = registry.tabs.get(key)
+    if not tab:
+        raise HTTPException(404, "not found")
+    await registry._close_tab(tab)
+    return {"closed": key}
+
+
+@ui_app.get("/api/matches")
+async def ui_matches(scope: str = "today") -> list[dict]:
+    """Same league-filtered list the playlist endpoint uses, but as structured JSON."""
+    if scope == "live":
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{API_BASE}/matches/live")
+            r.raise_for_status()
+            matches = [m for m in r.json() if m.get("category") == "football"]
+    else:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{API_BASE}/matches/football")
+            r.raise_for_status()
+            matches = r.json()
+
+    now_ms = time.time() * 1000
+    out = []
+    for m in matches:
+        league = detect_league(m)
+        echo = first_echo_source(m)
+        out.append({
+            "title": m.get("title"),
+            "league": league,
+            "echo_id": echo["id"] if echo else None,
+            "in_playlist": bool(league and echo),
+            "starts_in_minutes": round((m.get("date", 0) - now_ms) / 60000) if m.get("date") else None,
+        })
+    return out
+
+
+INDEX_HTML = """\
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>streamedtom3u · Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #181b25; --border: #262a38;
+    --fg: #e6e8ee; --muted: #8b91a6; --accent: #6ea8fe;
+    --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, -apple-system, sans-serif;
+    background: var(--bg); color: var(--fg); }
+  header { padding: 20px 28px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 16px; }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  header .pill { margin-left: auto; padding: 4px 10px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; letter-spacing: .03em; }
+  .pill.ok { background: rgba(74,222,128,.15); color: var(--ok); }
+  .pill.err { background: rgba(248,113,113,.15); color: var(--err); }
+  main { padding: 24px 28px; display: grid; gap: 24px;
+    grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden; }
+  .card h2 { margin: 0; padding: 14px 18px; font-size: 13px; font-weight: 600;
+    color: var(--muted); text-transform: uppercase; letter-spacing: .05em;
+    border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
+  .card .body { padding: 16px 18px; }
+  .stats { display: grid; grid-template-columns: repeat(2,1fr); gap: 14px 24px; }
+  .stat .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .stat .v { font-family: var(--mono); font-size: 18px; font-weight: 500; margin-top: 2px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 9px 18px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 11px;
+    text-transform: uppercase; letter-spacing: .04em; background: rgba(0,0,0,.15); }
+  td.mono { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  td a { color: var(--accent); text-decoration: none; }
+  td a:hover { text-decoration: underline; }
+  td .badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
+    background: rgba(110,168,254,.15); color: var(--accent); }
+  td .badge.muted { background: rgba(139,145,166,.15); color: var(--muted); }
+  td button { background: transparent; border: 1px solid var(--border); color: var(--err);
+    border-radius: 6px; padding: 3px 10px; cursor: pointer; font-size: 11px; }
+  td button:hover { border-color: var(--err); }
+  .empty { padding: 22px 18px; color: var(--muted); font-style: italic; text-align: center; }
+  footer { padding: 16px 28px; color: var(--muted); font-size: 11px; }
+  footer code { font-family: var(--mono); background: var(--panel);
+    padding: 2px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>streamedtom3u</h1>
+  <span class="sub" id="sub">…</span>
+  <span class="pill" id="health">…</span>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Status</h2>
+    <div class="body">
+      <div class="stats" id="stats">…</div>
+    </div>
+  </section>
+
+  <section class="card" style="grid-column: 1 / -1;">
+    <h2>Aktive Streams <span id="tab-count" style="color:var(--muted);font-weight:400;"></span></h2>
+    <div id="streams-wrap"><div class="empty">Lade …</div></div>
+  </section>
+
+  <section class="card" style="grid-column: 1 / -1;">
+    <h2>Spiele (heute) <span id="match-count" style="color:var(--muted);font-weight:400;"></span></h2>
+    <div id="matches-wrap"><div class="empty">Lade …</div></div>
+  </section>
+</main>
+
+<footer>
+  Refresh: 5 s · Playlist: <code id="playlist-url">…</code>
+</footer>
+
+<script>
+const fmtBytes = (n) => {
+  if (!n) return "0 B";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0;
+  while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
+  return n.toFixed(i === 0 ? 0 : 1) + " " + u[i];
+};
+const fmtDuration = (s) => {
+  if (s == null) return "—";
+  s = Math.round(s);
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s/60) + "m " + (s%60) + "s";
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+  return h + "h " + m + "m";
+};
+
+function escape(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  })[c]);
+}
+
+async function load() {
+  // Default API host: current origin; the stream URLs in the table point to the
+  // proxy port (one below the UI port — convention: UI=8768, proxy=8765 by default).
+  const playlistBase = window.location.protocol + "//" + window.location.hostname + ":" + PROXY_PORT;
+  document.getElementById("playlist-url").textContent = playlistBase + "/playlist.m3u";
+
+  try {
+    const [statusRes, streamsRes, matchesRes] = await Promise.all([
+      fetch("/api/status"),
+      fetch("/api/streams"),
+      fetch("/api/matches"),
+    ]);
+    const status = await statusRes.json();
+    const streams = await streamsRes.json();
+    const matches = await matchesRes.json();
+
+    document.getElementById("sub").textContent =
+      "Uptime " + fmtDuration(status.uptime_seconds);
+    const ok = status.browser_ok;
+    const pill = document.getElementById("health");
+    pill.className = "pill " + (ok ? "ok" : "err");
+    pill.textContent = ok ? "● Browser läuft" : "● Browser tot";
+
+    document.getElementById("stats").innerHTML = `
+      <div class="stat"><div class="k">Aktive Tabs</div><div class="v">${status.active_tabs}</div></div>
+      <div class="stat"><div class="k">Uptime</div><div class="v">${fmtDuration(status.uptime_seconds)}</div></div>
+      <div class="stat"><div class="k">m3u8 ausgeliefert</div><div class="v">${status.m3u8_served}</div></div>
+      <div class="stat"><div class="k">m3u8 Fehler</div><div class="v" style="color:${status.m3u8_errors?'var(--err)':'inherit'}">${status.m3u8_errors}</div></div>
+      <div class="stat"><div class="k">TS-Segmente</div><div class="v">${status.segments_served}</div></div>
+      <div class="stat"><div class="k">TS-Fehler</div><div class="v" style="color:${status.segment_errors?'var(--err)':'inherit'}">${status.segment_errors}</div></div>
+      <div class="stat"><div class="k">Daten gestreamt</div><div class="v">${fmtBytes(status.bytes_proxied)}</div></div>
+      <div class="stat"><div class="k">Idle-Limit</div><div class="v">${status.idle_close_seconds}s</div></div>
+    `;
+
+    document.getElementById("tab-count").textContent = `(${streams.length})`;
+    const streamsWrap = document.getElementById("streams-wrap");
+    if (streams.length === 0) {
+      streamsWrap.innerHTML = '<div class="empty">Kein aktiver Stream — Tabs werden geöffnet, sobald ein Client einen Stream anfordert.</div>';
+    } else {
+      streamsWrap.innerHTML = `
+        <table>
+          <thead><tr>
+            <th>Match</th><th>m3u8-Alter</th><th>Größe</th><th>Idle</th><th>Embed</th><th></th>
+          </tr></thead>
+          <tbody>
+            ${streams.map(s => `
+              <tr>
+                <td class="mono">${escape(s.key)}</td>
+                <td>${s.m3u8_age_seconds != null
+                    ? '<span class="badge' + (s.m3u8_age_seconds > 30 ? ' muted' : '') + '">' + fmtDuration(s.m3u8_age_seconds) + '</span>'
+                    : '<span class="badge muted">—</span>'}</td>
+                <td>${fmtBytes(s.m3u8_bytes)}</td>
+                <td>${fmtDuration(s.idle_seconds)}</td>
+                <td class="mono"><a href="${escape(s.embed_url)}" target="_blank" rel="noopener">open ↗</a></td>
+                <td><button data-key="${escape(s.key)}">stop</button></td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>`;
+      streamsWrap.querySelectorAll("button[data-key]").forEach(b => {
+        b.onclick = async () => {
+          if (!confirm("Tab schließen: " + b.dataset.key + "?")) return;
+          b.disabled = true;
+          await fetch("/api/streams/" + b.dataset.key, { method: "DELETE" });
+          await load();
+        };
+      });
+    }
+
+    const matchesWrap = document.getElementById("matches-wrap");
+    const inPlaylist = matches.filter(m => m.in_playlist);
+    document.getElementById("match-count").textContent =
+      `(${inPlaylist.length} in Playlist · ${matches.length - inPlaylist.length} gefiltert)`;
+    if (matches.length === 0) {
+      matchesWrap.innerHTML = '<div class="empty">Keine Football-Matches in der API.</div>';
+    } else {
+      matchesWrap.innerHTML = `
+        <table>
+          <thead><tr><th>Match</th><th>Liga</th><th>Startet</th><th>echo-ID</th><th></th></tr></thead>
+          <tbody>
+            ${matches.map(m => {
+              const playUrl = m.in_playlist
+                ? playlistBase + "/stream/echo/" + encodeURIComponent(m.echo_id) + "/1.m3u8"
+                : null;
+              return `
+                <tr style="${m.in_playlist ? '' : 'opacity:.5'}">
+                  <td>${escape(m.title)}</td>
+                  <td>${m.league
+                    ? '<span class="badge">' + escape(m.league) + '</span>'
+                    : '<span class="badge muted">—</span>'}</td>
+                  <td>${m.starts_in_minutes == null ? "—" :
+                       m.starts_in_minutes <= 0 ? '<span class="badge">live</span>' :
+                       'in ' + m.starts_in_minutes + 'm'}</td>
+                  <td class="mono">${escape(m.echo_id || "—")}</td>
+                  <td>${playUrl ? '<a href="' + playUrl + '" target="_blank" rel="noopener">m3u8 ↗</a>' : ""}</td>
+                </tr>`;
+            }).join("")}
+          </tbody>
+        </table>`;
+    }
+
+  } catch (err) {
+    document.getElementById("health").className = "pill err";
+    document.getElementById("health").textContent = "● Fehler beim Laden";
+    console.error(err);
+  }
+}
+
+const PROXY_PORT = __PROXY_PORT__;
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>
+"""
+
+
+@ui_app.get("/", response_class=Response)
+async def ui_index() -> Response:
+    proxy_port = int(os.environ.get("PORT", "8765"))
+    html = INDEX_HTML.replace("__PROXY_PORT__", str(proxy_port))
+    return Response(html, media_type="text/html; charset=utf-8")
+
+
+# ---------- Entrypoint: run both servers in one process ----------
+
+async def _serve_both() -> None:
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8765")))
+
+    proxy_port = int(os.environ.get("PORT", "8765"))
+    ui_port = int(os.environ.get("UI_PORT", "8768"))
+
+    cfg_proxy = uvicorn.Config(app, host="0.0.0.0", port=proxy_port, log_level=os.environ.get("LOG_LEVEL", "info").lower())
+    cfg_ui = uvicorn.Config(ui_app, host="0.0.0.0", port=ui_port, log_level="warning")
+
+    server_proxy = uvicorn.Server(cfg_proxy)
+    server_ui = uvicorn.Server(cfg_ui)
+
+    log.info("proxy on :%d  ·  UI on :%d", proxy_port, ui_port)
+    await asyncio.gather(server_proxy.serve(), server_ui.serve())
+
+
+if __name__ == "__main__":
+    asyncio.run(_serve_both())

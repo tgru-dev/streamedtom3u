@@ -31,8 +31,14 @@ docker run -d \
   --restart unless-stopped \
   --shm-size=1g \
   -p 8765:8765 \
+  -p 8768:8768 \
   ghcr.io/tgru-dev/streamedtom3u:latest
 ```
+
+| Port | Zweck |
+| --- | --- |
+| `8765` | M3U-/HLS-Proxy für Jellyfin |
+| `8768` | Web-Dashboard zur Statuskontrolle |
 
 `--shm-size=1g` ist wichtig: Chromium braucht mehr als die Docker-Defaults von 64 MB,
 sonst crasht der Tab nach kurzer Zeit.
@@ -79,7 +85,25 @@ Spiele ohne `echo`-Source oder ohne erkennbare Liga werden übersprungen.
 > (z. B. `live_germany-bundesliga_…`, `live_fifa-world-cup_…`). Wenn ein Match
 > trotz erwarteter Liga nicht erscheint, hilft `/debug/football`.
 
-## Endpoints
+## Dashboard
+
+Unter `http://<server-ip>:8768/` läuft ein kleines Web-Dashboard:
+
+- Status: Uptime, Browser-Health, Zähler für ausgelieferte m3u8 / TS-Segmente
+- Liste aller gerade offenen Browser-Tabs inkl. m3u8-Alter, Idle-Zeit und Stop-Button
+- Heutige Football-Matches mit erkannter Liga (in Playlist ↔ gefiltert)
+- Auto-Refresh alle 5 s, keine Auth — nur im internen Netz exponieren
+
+JSON-Endpoints für eigene Tools:
+
+| Pfad | Antwort |
+| --- | --- |
+| `GET :8768/api/status` | Counter + Browser-Health |
+| `GET :8768/api/streams` | Aktive Stream-Tabs |
+| `GET :8768/api/matches` | Heutige Football-Matches + Liga-Detection |
+| `DELETE :8768/api/streams/{src}/{id}/{n}` | Tab manuell schließen |
+
+## Endpoints (Proxy auf Port 8765)
 
 | Pfad | Zweck |
 | --- | --- |

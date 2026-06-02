@@ -6,7 +6,9 @@ services:
     # Chromium needs a larger /dev/shm than Docker's 64 MB default
     shm_size: "1gb"
     ports:
-      - "8765:8765"
+      - "8765:8765"   # M3U / HLS proxy (Jellyfin)
+      - "8768:8768"   # Dashboard / UI
     environment:
       - PORT=8765
+      - UI_PORT=8768
       - LOG_LEVEL=INFO
